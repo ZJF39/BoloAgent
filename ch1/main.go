@@ -9,6 +9,7 @@ import (
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 )
 
 type Decision struct {
@@ -21,34 +22,79 @@ type Decision struct {
 func main() {
 	ctx := context.Background()
 
-	// 1. 创建 ChatModel
-	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  os.Getenv("OPENAI_API_KEY"),
-		Model:   os.Getenv("OPENAI_MODEL"),
-		BaseURL: os.Getenv("OPENAI_BASE_URL"),
+	rawSchema := json.RawMessage(`
+{
+  "type": "object",
+  "properties": {
+    "intent": {
+      "type": "string"
+    },
+    "need_tool": {
+      "type": "boolean"
+    },
+    "tool": {
+      "type": "string",
+      "enum": ["calculator", "search", ""]
+    },
+    "query": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "intent",
+    "need_tool",
+    "tool",
+    "query"
+  ],
+  "additionalProperties": false
+}
+`)
 
-		ResponseFormat: &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-		},
-	})
-	if err != nil {
-		log.Fatalf("创建 ChatModel 失败: %v", err)
+	var responseSchema jsonschema.Schema
+	if err := json.Unmarshal(rawSchema, &responseSchema); err != nil {
+		log.Fatalf("解析 JSON Schema 失败: %v", err)
 	}
 
-	// 2. 构造对话消息
-	// 由于规定了response_format为json，Eino规定必须在Prompt中添加json字样，这是一个防呆机制
+	chatModel, err := openai.NewChatModel(
+		ctx,
+		&openai.ChatModelConfig{
+			APIKey:  os.Getenv("OPENAI_API_KEY"),
+			Model:   os.Getenv("OPENAI_MODEL"),
+			BaseURL: os.Getenv("OPENAI_BASE_URL"),
+
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
+
+				JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
+					Name:        "agent_decision",
+					Description: "Agent 对用户请求的决策结果",
+					JSONSchema:  &responseSchema,
+					Strict:      true,
+				},
+			},
+		},
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	messages := []*schema.Message{
 		{
 			Role: schema.System,
 			Content: `
-分析用户请求。
+你负责分析用户请求。
 
-返回json字段：
+如果需要数学计算：
+tool = "calculator"
 
-intent: 用户意图
-need_tool: 是否需要工具
-tool: calculator、search 或空字符串
-query: 交给工具执行的参数
+如果需要查询外部信息：
+tool = "search"
+
+如果不需要工具：
+tool = ""
+need_tool = false
+
+query 保存需要交给工具处理的内容。
 `,
 		},
 		{
@@ -56,65 +102,27 @@ query: 交给工具执行的参数
 			Content: "帮我计算 23 * 47",
 		},
 	}
+
 	response, err := chatModel.Generate(ctx, messages)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("raw:")
+	fmt.Println("模型输出：")
 	fmt.Println(response.Content)
 
 	var decision Decision
 
-	// JSON反序列化
 	if err := json.Unmarshal(
 		[]byte(response.Content),
 		&decision,
 	); err != nil {
-		log.Fatal(err)
+		log.Fatalf("JSON 解析失败: %v", err)
 	}
-	fmt.Println("反序列化:")
-	fmt.Printf("%+v\n", decision)
 
-	// scanner := bufio.NewScanner(os.Stdin)
-
-	// for {
-	// 	fmt.Print("You> ")
-	// 	if !scanner.Scan() {
-	// 		break
-	// 	}
-	// 	/**
-	// 	 * @description: 获取用户输入
-	// 	 * TrimSpace 函数用于去除输入字符串首尾的空白字符。
-	// 	 */
-	// 	input := strings.TrimSpace(scanner.Text())
-
-	// 	if input == "exit" {
-	// 		break
-	// 	}
-	// 	// 加入用户信息
-	// 	messages = append(messages, &schema.Message{
-	// 		Role:    schema.User,
-	// 		Content: input,
-	// 	})
-	// 	// 调用模型
-	// 	response, err := chatModel.Generate(ctx, messages)
-	// 	if err != nil {
-	// 		log.Printf("模型调用失败: %v\n", err)
-	// 		continue
-	// 	}
-
-	// 	fmt.Printf("AI> %s\n\n", response.Content)
-	// 	// 保存模型回复
-	// 	messages = append(messages, response)
-	// }
-
-	// // // 3. 调用 LLM
-	// // response, err := chatModel.Generate(ctx, messages)
-	// // if err != nil {
-	// // 	log.Fatalf("调用模型失败: %v", err)
-	// // }
-
-	// // // 4. 输出模型回复
-	// // fmt.Println(response.Content)
+	fmt.Println("\n程序解析结果：")
+	fmt.Printf("intent    = %s\n", decision.Intent)
+	fmt.Printf("need_tool = %v\n", decision.NeedTool)
+	fmt.Printf("tool      = %s\n", decision.Tool)
+	fmt.Printf("query     = %s\n", decision.Query)
 }
