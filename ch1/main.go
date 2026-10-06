@@ -26,30 +26,30 @@ func main() {
 		APIKey:  os.Getenv("OPENAI_API_KEY"),
 		Model:   os.Getenv("OPENAI_MODEL"),
 		BaseURL: os.Getenv("OPENAI_BASE_URL"),
+
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		},
 	})
 	if err != nil {
 		log.Fatalf("创建 ChatModel 失败: %v", err)
 	}
 
 	// 2. 构造对话消息
+	// 由于规定了response_format为json，Eino规定必须在Prompt中添加json字样，这是一个防呆机制
 	messages := []*schema.Message{
 		{
 			Role: schema.System,
-			Content: `你是一个请求分类器。
+			Content: `
+分析用户请求。
 
-请分析用户请求，并且只返回 JSON。
+返回json字段：
 
-JSON 格式：
-
-{
-  "intent": "用户意图",
-  "need_tool": true 或 false,
-  "tool": "calculator、search 或空字符串",
-  "query": "需要交给工具处理的内容"
-}
-
-不要输出 Markdown格式代码块。
-不要输出解释。`,
+intent: 用户意图
+need_tool: 是否需要工具
+tool: calculator、search 或空字符串
+query: 交给工具执行的参数
+`,
 		},
 		{
 			Role:    schema.User,
@@ -61,27 +61,20 @@ JSON 格式：
 		log.Fatal(err)
 	}
 
-	fmt.Println("模型原始输出：")
+	fmt.Println("raw:")
 	fmt.Println(response.Content)
 
 	var decision Decision
 
 	// JSON反序列化
-	err = json.Unmarshal(
+	if err := json.Unmarshal(
 		[]byte(response.Content),
 		&decision,
-	)
-
-	if err != nil {
-		log.Fatalf("JSON 解析失败: %v", err)
+	); err != nil {
+		log.Fatal(err)
 	}
-
-	fmt.Printf("\n解析后的结构体：%+v\n", decision)
-
-	fmt.Println("Intent:", decision.Intent)
-	fmt.Println("NeedTool:", decision.NeedTool)
-	fmt.Println("Tool:", decision.Tool)
-	fmt.Println("Query:", decision.Query)
+	fmt.Println("反序列化:")
+	fmt.Printf("%+v\n", decision)
 
 	// scanner := bufio.NewScanner(os.Stdin)
 
