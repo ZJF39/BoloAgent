@@ -1,233 +1,275 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
-	"github.com/cloudwego/eino/components/tool/utils"
-	"github.com/cloudwego/eino/schema"
+
+	"BoloAgent/ch2/rag"
 )
 
-type CalculatorInput struct {
-	A float64 `json:"a" jsonschema:"required" jsonschema_description:"第一个数字"`
+func main() {
+	// 整个 RAG 请求最多运行 60 秒。
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		60*time.Second,
+	)
+	defer cancel()
 
-	B float64 `json:"b" jsonschema:"required" jsonschema_description:"第二个数字"`
+	// ========================================
+	// 1. Load
+	// Markdown → Document
+	// ========================================
 
-	Operation string `json:"operation" jsonschema:"required,enum=add,enum=subtract,enum=multiply,enum=divide" jsonschema_description:"运算类型"`
-}
+	documents, err :=
+		rag.LoadMarkdownDocuments("./docs")
 
-type CalculatorOutput struct {
-	Result float64 `json:"result"`
-}
+	if err != nil {
+		log.Fatal(err)
+	}
 
-func calculator(ctx context.Context, input *CalculatorInput) (*CalculatorOutput, error) {
+	fmt.Printf(
+		"加载原始文档: %d 个\n",
+		len(documents),
+	)
 
-	var result float64
+	// ========================================
+	// 2. Chunk
+	// Document → Chunks
+	// ========================================
 
-	switch input.Operation {
+	chunks, err :=
+		rag.SplitDocuments(
+			ctx,
+			documents,
+			300, // ChunkSize
+			50,  // OverlapSize
+		)
 
-	case "add":
-		result = input.A + input.B
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	case "subtract":
-		result = input.A - input.B
+	fmt.Printf(
+		"切分后 Chunk: %d 个\n",
+		len(chunks),
+	)
 
-	case "multiply":
-		result = input.A * input.B
-
-	case "divide":
-		if input.B == 0 {
-			return nil, fmt.Errorf("除数不能为 0")
-		}
-
-		result = input.A / input.B
-
-	default:
-		return nil, fmt.Errorf(
-			"不支持的运算类型: %s",
-			input.Operation,
+	for _, chunk := range chunks {
+		fmt.Printf(
+			"- %s (%d 字符)\n",
+			chunk.ID,
+			len([]rune(chunk.Content)),
 		)
 	}
 
-	return &CalculatorOutput{
-		Result: result,
-	}, nil
-}
+	// ========================================
+	// 3. 创建 Embedder
+	// ========================================
 
-func main() {
-	ctx := context.Background()
+	embedder, err :=
+		rag.NewEmbedder(ctx)
 
-	// =========================
-	// 1. 创建 Tool
-	// =========================
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	calculatorTool, err := utils.InferTool(
-		"calculator",
-		"执行两个数字之间的加、减、乘、除运算。遇到数学计算时使用。",
-		calculator,
+	// ========================================
+	// 4. Embed Documents
+	// Chunks → Vectors
+	// ========================================
+
+	fmt.Println("\n正在生成 Document Embedding...")
+
+	vectors, err :=
+		rag.EmbedDocuments(
+			ctx,
+			embedder,
+			chunks,
+		)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf(
+		"Embedding 完成: %d 个向量\n",
+		len(vectors),
 	)
-	if err != nil {
+
+	if len(vectors) > 0 {
+		fmt.Printf(
+			"向量维度: %d\n",
+			len(vectors[0]),
+		)
+	}
+
+	// ========================================
+	// 5. Store
+	// Document + Vector → MemoryStore
+	// ========================================
+
+	store := rag.NewMemoryStore()
+
+	if err := store.Add(
+		chunks,
+		vectors,
+	); err != nil {
 		log.Fatal(err)
 	}
 
-	calculatorInfo, err := calculatorTool.Info(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// =========================
-	// 2. 创建模型
-	// =========================
-
-	chatModel, err := openai.NewChatModel(
-		ctx,
-		&openai.ChatModelConfig{
-			APIKey:  os.Getenv("OPENAI_API_KEY"),
-			Model:   os.Getenv("OPENAI_MODEL"),
-			BaseURL: os.Getenv("OPENAI_BASE_URL"),
-		},
+	fmt.Printf(
+		"Vector Store 当前记录: %d\n",
+		store.Size(),
 	)
+
+	// ========================================
+	// 6. 用户输入问题
+	// ========================================
+
+	fmt.Print("\n请输入问题: ")
+
+	scanner := bufio.NewScanner(os.Stdin)
+
+	if !scanner.Scan() {
+		log.Fatal("无法读取用户输入")
+	}
+
+	question :=
+		strings.TrimSpace(scanner.Text())
+
+	if question == "" {
+		log.Fatal("问题不能为空")
+	}
+
+	// ========================================
+	// 7. Retrieve
+	// Query → Embedding → Similarity → TopK
+	// ========================================
+
+	results, err :=
+		rag.Retrieve(
+			ctx,
+			embedder,
+			store,
+			question,
+			3,
+		)
+
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// =========================
-	// 3. 把 Tool 注册给模型
-	// =========================
+	fmt.Println("\n===== 检索结果 =====")
 
-	modelWithTools, err := chatModel.WithTools(
-		[]*schema.ToolInfo{
-			calculatorInfo,
-		},
+	for i, doc := range results {
+
+		fmt.Printf(
+			"\n[%d] source=%v chunk=%v score=%.4f\n",
+			i+1,
+			doc.MetaData["source"],
+			doc.MetaData["chunk"],
+			doc.Score(),
+		)
+
+		fmt.Println(doc.Content)
+	}
+
+	// ========================================
+	// 8. 创建 ChatModel
+	//
+	// 这里继续使用你之前的
+	// OpenAI-compatible DeepSeek 配置。
+	// ========================================
+
+	apiKey := os.Getenv("CHAT_API_KEY")
+	modelName := os.Getenv("CHAT_MODEL")
+	baseURL := os.Getenv("CHAT_BASE_URL")
+
+	if apiKey == "" {
+		log.Fatal(
+			"CHAT_API_KEY 未设置",
+		)
+	}
+
+	if modelName == "" {
+		log.Fatal(
+			"CHAT_MODEL 未设置",
+		)
+	}
+
+	chatModel, err :=
+		openai.NewChatModel(
+			ctx,
+			&openai.ChatModelConfig{
+				APIKey:  apiKey,
+				Model:   modelName,
+				BaseURL: baseURL,
+			},
+		)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// ========================================
+	// 9. Build Prompt
+	//
+	// Question
+	// +
+	// Retrieved Documents
+	// +
+	// Citations
+	// ========================================
+
+	messages :=
+		rag.BuildRAGMessages(
+			question,
+			results,
+		)
+
+	// ========================================
+	// 10. Generate
+	// ========================================
+
+	response, err :=
+		chatModel.Generate(
+			ctx,
+			messages,
+		)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(
+		"\n===== RAG 最终回答 =====",
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	// =========================
-	// 4. 初始消息
-	// =========================
-
-	messages := []*schema.Message{
-		{
-			Role: schema.System,
-			Content: `
-你是一名助手。
-
-如果用户要求进行数学计算，
-请使用 calculator 工具。
-
-拿到工具结果以后，
-根据结果回答用户。
-`,
-		},
-		{
-			Role:    schema.User,
-			Content: "2*3",
-		},
-	}
-
-	// =========================
-	// 5. 第一次调用 LLM
-	// =========================
-
-	response, err := modelWithTools.Generate(
-		ctx,
-		messages,
+	fmt.Println(
+		response.Content,
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	// =========================
-	// 6. 如果没有 Tool Call
-	// =========================
+	// ========================================
+	// 11. 再把 Citation 映射打印出来
+	// ========================================
 
-	if len(response.ToolCalls) == 0 {
-		fmt.Println("模型直接回答：")
-		fmt.Println(response.Content)
-		return
-	}
-
-	// =========================
-	// 7. 保存 Assistant Message
-	// =========================
-
-	messages = append(messages, response)
-
-	// =========================
-	// 8. 执行每一个 Tool Call
-	// =========================
-
-	for _, toolCall := range response.ToolCalls {
-
-		fmt.Println("模型请求调用工具:")
-		fmt.Println("ID:", toolCall.ID)
-		fmt.Println("Name:", toolCall.Function.Name)
-		fmt.Println("Arguments:", toolCall.Function.Arguments)
-
-		switch toolCall.Function.Name {
-
-		case "calculator":
-
-			// 真正执行 calculator Tool
-			toolResult, err := calculatorTool.InvokableRun(
-				ctx,
-				toolCall.Function.Arguments,
-			)
-
-			if err != nil {
-				log.Fatalf(
-					"calculator 执行失败: %v",
-					err,
-				)
-			}
-
-			fmt.Println("Tool 执行结果:")
-			fmt.Println(toolResult)
-
-			// =========================
-			// 9. 构造 Tool Message
-			// =========================
-
-			toolMessage := schema.ToolMessage(
-				toolResult,
-				toolCall.ID,
-			)
-
-			messages = append(
-				messages,
-				toolMessage,
-			)
-
-		default:
-			log.Fatalf(
-				"未知工具: %s",
-				toolCall.Function.Name,
-			)
-		}
-	}
-
-	// =========================
-	// 10. 把 Tool Result
-	//     再次交给模型
-	// =========================
-
-	finalResponse, err := modelWithTools.Generate(
-		ctx,
-		messages,
+	fmt.Println(
+		"\n===== Citation Mapping =====",
 	)
-	if err != nil {
-		log.Fatal(err)
+
+	for i, doc := range results {
+		fmt.Printf(
+			"[%d] %v#chunk-%v\n",
+			i+1,
+			doc.MetaData["source"],
+			doc.MetaData["chunk"],
+		)
 	}
-
-	// =========================
-	// 11. 最终答案
-	// =========================
-
-	fmt.Println("\n模型最终回答:")
-	fmt.Println(finalResponse.Content)
 }
